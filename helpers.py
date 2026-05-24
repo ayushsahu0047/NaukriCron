@@ -84,6 +84,10 @@ def is_valid_title(title: str) -> tuple:
     import config
     title_lower = title.lower().strip()
 
+    # Can't read title from card → URL already filtered to relevant category → attempt apply
+    if not title_lower:
+        return True, False
+
     for word in config.REJECT_KEYWORDS:
         if word in title_lower:
             return False, False
