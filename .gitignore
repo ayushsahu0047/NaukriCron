@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+*.log
+naukri_log.txt
+naukri_cookies.json
+applied_jobs.json
+applied_jobs.txt
+selector_cache.json
+helpers.py.tmp.*
