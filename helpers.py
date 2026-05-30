@@ -1,4 +1,5 @@
 import re
+import json
 import time
 import random
 import logging
@@ -7,6 +8,7 @@ from pathlib import Path
 log = logging.getLogger("naukri")
 
 APPLIED_FILE = Path("applied_jobs.txt")
+FAILED_FILE  = Path("failed_jobs.json")   # permanently broken job IDs
 
 
 # ── Timing ─────────────────────────────────────────────────────────────────────
@@ -27,103 +29,110 @@ def get_job_priority(time_label: str) -> int:
     return 99  # 4+ days or unknown → stop
 
 
-# ── Location scoring ───────────────────────────────────────────────────────────
+# ── Location helpers (kept for display; no filtering applied) ──────────────────
 def get_location_priority(location_text: str) -> int:
-    """
-    Returns location score:
-    1 = Indore (best)
-    2 = Remote / WFH
-    3 = Hybrid
-    4 = Other India city
-    """
     loc = location_text.lower().strip()
-
-    if "indore" in loc:
-        return 1
-
-    if any(w in loc for w in ["remote", "work from home", "wfh", "anywhere", "pan india"]):
-        return 2
-
-    if "hybrid" in loc:
-        return 3
-
+    if "indore" in loc:                                                  return 1
+    if any(w in loc for w in ["remote", "work from home", "wfh"]):      return 2
+    if "hybrid" in loc:                                                  return 3
     return 4
 
 
 def is_preferred_location(location_text: str) -> bool:
-    """Returns True if location is Indore, Remote, WFH, or Hybrid."""
-    loc = location_text.lower()
-    return any(w in loc for w in [
-        "indore", "remote", "work from home",
-        "wfh", "hybrid", "anywhere", "pan india",
-    ])
+    """Kept for reference; location filtering is disabled — bot applies everywhere."""
+    return True  # always True: no location restriction
 
 
 # ── Title keyword filter ───────────────────────────────────────────────────────
-GENERIC_TITLES = [
-    "software developer",
-    "software engineer",
-    "web developer",
-    "web engineer",
-    "application developer",
-    "ai developer",
-    "ai engineer",
-    "generative ai",
-    "python developer",
-]
-
-
 def is_valid_title(title: str) -> tuple:
     """
-    Returns (is_valid: bool, needs_description_check: bool)
+    Two-stage title check:
+      (False, False)  → hard reject immediately
+      (True,  False)  → specific tech match → apply directly
+      (True,  True)   → generic title → open job page, verify skills in description
 
-    is_valid = False                       → skip immediately
-    is_valid = True, needs_check = False   → apply directly (clear match)
-    is_valid = True, needs_check = True    → open job, verify description has React/Node
+    Logic (Problem 3):
+      1. If title contains any REJECT keyword           → reject
+      2. If title contains any ACCEPT_SPECIFIC keyword  → accept (no desc check)
+      3. If title contains any ACCEPT_GENERIC keyword   → accept (needs desc check)
+      4. Otherwise                                      → reject
     """
     import config
     title_lower = title.lower().strip()
 
-    # Can't read title from card → URL already filtered to relevant category → attempt apply
     if not title_lower:
+        # Cannot read title from card — URL is already relevant, attempt apply
         return True, False
 
+    # Step 1: hard reject
     for word in config.REJECT_KEYWORDS:
         if word in title_lower:
             return False, False
 
-    for word in config.ACCEPT_KEYWORDS:
+    # Step 2: specific tech keyword → direct apply
+    for word in config.ACCEPT_SPECIFIC:
         if word in title_lower:
-            for generic in GENERIC_TITLES:
-                if generic in title_lower:
-                    return True, True
             return True, False
+
+    # Step 3: generic keyword → needs description confirmation
+    for word in config.ACCEPT_GENERIC:
+        if word in title_lower:
+            return True, True
 
     return False, False
 
 
+# ── Description skill check + fresher/0-year detection ────────────────────────
+_SKILL_KEYWORDS = [
+    "react", "reactjs", "node", "nodejs",
+    "javascript", "mern", "mongodb", "mongo",
+    "express", "expressjs", "next.js", "nextjs",
+    "redux", "rest api", "graphql", "typescript",
+    "html", "css", "tailwind", "material ui",
+    "ant design", "socket.io",
+]
+
+_FRESHER_PATTERNS = [
+    r'\b0\s*(?:to|-)\s*1\s*year',
+    r'\b0\s*years?\s*(?:of\s*)?experience',
+    r'\bfreshers?\s+(?:only|preferred|can apply)',
+    r'no\s+experience\s+required',
+    r'experience\s*:\s*0',
+]
+
+
 def check_description_for_skills(driver) -> bool:
     """
-    Read the job description from the current tab and return True
-    if it mentions React/Node/MERN skills. Used for generic titles.
+    Open-tab description check (called only for generic titles).
+
+    Returns False if:
+      - Description signals a fresher/0-year role (Problem 5)
+      - No MERN-stack skills found
+
+    Returns True if at least 1 skill keyword is present.
     """
-    SKILL_KEYWORDS = [
-        "react", "node", "javascript", "mern",
-        "mongodb", "express", "full stack",
-        "frontend", "next.js", "typescript",
-        "rest api", "vue", "angular",
-    ]
     try:
         from selenium.webdriver.common.by import By
         body = driver.find_element(By.TAG_NAME, "body").text.lower()
-        matches = [kw for kw in SKILL_KEYWORDS if kw in body]
+
+        # Problem 5: reject fresher / 0-year roles in description
+        for pattern in _FRESHER_PATTERNS:
+            if re.search(pattern, body, re.IGNORECASE):
+                log.info("  ⏭  Description requires 0 yrs / fresher — skip")
+                return False
+
+        # Problem 3: at least 1 MERN skill must appear
+        matches = [kw for kw in _SKILL_KEYWORDS if kw in body]
         if matches:
-            log.info(f"  ✅ Description has skills: {', '.join(matches[:4])}")
+            log.info(f"  ✅ Description skills: {', '.join(matches[:4])}")
             return True
-        log.info("  ⏭  No relevant skills found in description")
+
+        log.info("  ⏭  No MERN skills found in description")
         return False
+
     except Exception:
-        return True  # Can't read description — attempt apply anyway
+        # Can't read description → attempt apply anyway (fail-safe)
+        return True
 
 
 # ── Job ID extraction ──────────────────────────────────────────────────────────
@@ -149,6 +158,32 @@ def load_applied_ids() -> set:
 def save_applied_id(job_id: str):
     with APPLIED_FILE.open("a", encoding="utf-8") as f:
         f.write(job_id + "\n")
+
+
+# ── Failed-jobs persistence (Problem 2) ───────────────────────────────────────
+def load_failed_ids() -> set:
+    """Load permanently broken job IDs so they are skipped on future runs."""
+    if FAILED_FILE.exists():
+        try:
+            data = json.loads(FAILED_FILE.read_text(encoding="utf-8"))
+            ids = set(str(x) for x in data if x)
+            log.info(f"Loaded {len(ids)} permanently failed job IDs from {FAILED_FILE}")
+            return ids
+        except Exception as exc:
+            log.warning(f"Could not read {FAILED_FILE}: {exc}")
+    return set()
+
+
+def save_failed_ids(failed_ids: set):
+    """Persist the current failed-ID set for the next run."""
+    try:
+        FAILED_FILE.write_text(
+            json.dumps(sorted(failed_ids), indent=2),
+            encoding="utf-8",
+        )
+        log.info(f"Saved {len(failed_ids)} failed IDs → {FAILED_FILE}")
+    except Exception as exc:
+        log.warning(f"Could not save failed IDs: {exc}")
 
 
 # ── Form field helpers ─────────────────────────────────────────────────────────
@@ -240,6 +275,17 @@ _LOCATION_SELS = [
 ]
 
 
+def get_card_priority_score(info: dict) -> int:
+    score = 0
+    if info.get("is_top_applicant"):    score += 100
+    if info.get("is_actively_hiring"):  score += 80
+    if info.get("is_recently_active"):  score += 60
+    if info.get("has_easy_apply"):      score += 20
+    tp = get_job_priority(info.get("time_label", ""))
+    score += {1: 40, 2: 35, 3: 30, 4: 25, 5: 20, 6: 10, 7: 5}.get(tp, 0)
+    return score
+
+
 def get_card_info(card) -> dict:
     from selenium.common.exceptions import NoSuchElementException
     from selenium.webdriver.common.by import By
@@ -282,6 +328,26 @@ def get_card_info(card) -> dict:
                     break
         except Exception:
             pass
+
+    # Badge detection for priority scoring
+    try:
+        card_text = card.text.lower()
+        card_html = card.get_attribute("innerHTML").lower()
+        info["is_top_applicant"]   = "top applicant" in card_text
+        info["is_actively_hiring"] = (
+            "actively hiring" in card_text or "urgently hiring" in card_text
+        )
+        info["is_recently_active"] = (
+            "recruiter was active" in card_text or
+            "recently active" in card_text or
+            "recruiter recently active" in card_text
+        )
+        info["has_easy_apply"] = "easy apply" in card_html or "1-click" in card_html
+    except Exception:
+        info["is_top_applicant"]   = False
+        info["is_actively_hiring"] = False
+        info["is_recently_active"] = False
+        info["has_easy_apply"]     = False
 
     for sel in _LOCATION_SELS:
         try:

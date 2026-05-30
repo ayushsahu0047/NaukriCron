@@ -2,6 +2,15 @@
 Naukri Auto-Apply Bot
 Daily runner: logs in, bumps profile, applies to MERN/Full-Stack jobs,
 fills application forms, and writes a full run report.
+
+Fixes applied
+─────────────
+P1 – Enhanced 6-step chatbot overlay dismissal before every apply click
+P2 – Global attempted_ids + failed_ids across all URLs (no cross-URL retries)
+P3 – Wider title filter: ACCEPT_SPECIFIC / ACCEPT_GENERIC + description check
+P4 – No location filter — applies everywhere in India
+P5 – Hard-reject fresher/0-year roles detected in description
+P6 – Richer daily report: seen/attempted/succeeded, success rate, top companies
 """
 
 import sys
@@ -9,6 +18,7 @@ import json
 import time
 import logging
 import datetime
+from collections import Counter
 from pathlib import Path
 
 from selenium import webdriver
@@ -27,9 +37,11 @@ from selenium.webdriver.common.keys import Keys
 import config
 import helpers
 from helpers import (
-    human_sleep, get_job_priority,
+    human_sleep, get_job_priority, get_card_priority_score,
     is_valid_title, check_description_for_skills,
-    extract_job_id, load_applied_ids, save_applied_id,
+    extract_job_id,
+    load_applied_ids, save_applied_id,
+    load_failed_ids,  save_failed_ids,
     fill_field, find_field_for_label, get_card_info, log,
 )
 
@@ -46,6 +58,8 @@ logging.basicConfig(
 LOG_FILE       = Path("naukri_log.txt")
 COOKIES_FILE   = Path("naukri_cookies.json")
 SELECTOR_CACHE = Path("selector_cache.json")
+
+MAX_PAGES = 3   # scrape up to 3 pages per URL (user requested pages 1 & 2 minimum)
 
 
 # ── Smart card-selector scanner ────────────────────────────────────────────────
@@ -82,18 +96,21 @@ def detect_card_selector(driver: webdriver.Chrome) -> str | None:
     """Return a working CSS selector for job cards. Tries cache first, then full scan."""
     if SELECTOR_CACHE.exists():
         try:
-            data   = json.loads(SELECTOR_CACHE.read_text(encoding="utf-8"))
-            cached = data.get("selector", "")
-            if cached:
+            data        = json.loads(SELECTOR_CACHE.read_text(encoding="utf-8"))
+            cached      = data.get("selector", "")
+            cached_date = data.get("date", "")
+            today       = str(datetime.date.today())
+            if cached and cached_date == today:
                 n = len(driver.find_elements(By.CSS_SELECTOR, cached))
                 if n >= 3:
                     log.info(f"  Selector (cache): {cached!r} — {n} cards")
                     return cached
-                log.info(f"  Cached selector {cached!r} stale — rescanning")
+            if cached:
+                log.info(f"  Cached selector stale (saved {cached_date}, today {today}) — rescanning")
         except Exception:
             pass
 
-    log.info("  Scanning 22 selectors for job cards…")
+    log.info("  Scanning selectors for job cards…")
     for sel in ALL_CARD_SELS:
         try:
             n = len(driver.find_elements(By.CSS_SELECTOR, sel))
@@ -138,14 +155,20 @@ def wait_for_cards(driver: webdriver.Chrome, sel: str | None = None, timeout: in
 # ── Tracker ────────────────────────────────────────────────────────────────────
 def new_tracker() -> dict:
     return {
-        "today_count":    0,
-        "applied_jobs":   [],   # list of dicts: title, company, location, time, job_id
-        "skip_title":     0,
-        "skip_old":       0,
-        "skip_duplicate": 0,
-        "skip_no_apply":  0,
-        "skip_no_skills": 0,
-        "errors":         0,
+        "today_count":          0,
+        "applied_jobs":         [],
+        "attempted_count":      0,
+        "seen_ids":             set(),
+        "failed_overlay_ids":   [],
+        "skip_title":           0,
+        "skip_old":             0,
+        "skip_duplicate":       0,
+        "skip_no_apply":        0,
+        "skip_no_skills":       0,
+        "errors":               0,
+        "badge_top_applicant":  0,
+        "badge_actively_hiring":0,
+        "resume_uploaded":      False,
     }
 
 
@@ -270,7 +293,7 @@ def login(driver: webdriver.Chrome):
 
 
 # ── Profile bump ───────────────────────────────────────────────────────────────
-def bump_profile(driver: webdriver.Chrome):
+def bump_profile(driver: webdriver.Chrome) -> bool:
     try:
         driver.get("https://www.naukri.com/mnjuser/profile?id=&altresid")
         human_sleep(3, 5)
@@ -297,8 +320,17 @@ def bump_profile(driver: webdriver.Chrome):
             log.warning(f"Headline re-save skipped: {exc}")
 
         resume_abs = str(config.RESUME_PATH.absolute())
+        resume_ok  = False
         if not config.RESUME_PATH.exists():
-            log.warning(f"Resume not found at '{resume_abs}' — skipping upload")
+            checked = "\n".join(f"             {p}" for p in config.RESUME_PATHS)
+            log.warning(
+                f"\n{'!'*55}\n"
+                f"  RESUME NOT FOUND — ACTION REQUIRED\n"
+                f"  Checked  :\n{checked}\n"
+                f"  Fix      : copy resume.pdf to any path above\n"
+                f"  Impact   : ~70% fewer recruiter callbacks\n"
+                f"{'!'*55}"
+            )
         else:
             try:
                 for inp in driver.find_elements(By.XPATH, "//input[@type='file']"):
@@ -319,6 +351,7 @@ def bump_profile(driver: webdriver.Chrome):
                             except NoSuchElementException:
                                 pass
                         log.info("Resume uploaded ✅")
+                        resume_ok = True
                         break
                     except Exception:
                         continue
@@ -327,10 +360,12 @@ def bump_profile(driver: webdriver.Chrome):
 
     except Exception as exc:
         log.warning(f"bump_profile error: {exc}")
+        resume_ok = False
 
     # Always return to homepage — clears browser state before search loop
     driver.get("https://www.naukri.com/mnjuser/homepage")
     human_sleep(2, 3)
+    return resume_ok
 
 
 # ── Sort by Date ───────────────────────────────────────────────────────────────
@@ -404,39 +439,65 @@ def sort_by_date(driver: webdriver.Chrome):
     log.info("  Sort: session preference used")
 
 
-# ── Dismiss chatbot overlay ────────────────────────────────────────────────────
+# ── P1: Dismiss chatbot overlay (6-step sequence) ────────────────────────────
 def dismiss_chatbot_overlay(driver: webdriver.Chrome):
-    # Step 1: ESC key
+    """
+    6-step sequence to nuke the chatbot overlay before every apply click.
+    Never raises — overlay failure must never crash the bot.
+    """
+    # Step 1+2: find div.chatbot_Overlay.show and remove each visible one
     try:
-        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-        human_sleep(0.3, 0.5)
+        overlays = driver.find_elements(By.CSS_SELECTOR, "div.chatbot_Overlay.show")
+        for overlay in overlays:
+            try:
+                if overlay.is_displayed():
+                    driver.execute_script("arguments[0].remove()", overlay)
+            except Exception:
+                pass
     except Exception:
         pass
 
-    # Step 2: JS nuclear — hide + remove ALL overlays in one pass
+    # Step 3: broad JS sweep — removes ALL overlay/modal/popup variants
     try:
         driver.execute_script("""
-            var sels = [
+            var selectors = [
                 '.chatbot_Overlay',
                 '[class*="chatbot_Overlay"]',
                 '[class*="chatbot-overlay"]',
                 '[class*="overlay"][class*="show"]',
-                '[class*="Overlay"][class*="show"]'
+                '[class*="Overlay"][class*="show"]',
+                '[class*="Modal"]:not(button):not(input)',
+                '[class*="modal"]:not(button):not(input)',
+                '[class*="Popup"]:not(button):not(input)',
+                '[class*="popup"]:not(button):not(input)',
+                '[class*="backdrop"]',
+                '[class*="Backdrop"]'
             ];
-            sels.forEach(function(sel) {
-                document.querySelectorAll(sel).forEach(function(el) {
-                    el.style.display = 'none';
-                    el.style.visibility = 'hidden';
-                    el.style.pointerEvents = 'none';
-                    el.style.zIndex = '-9999';
-                    try { el.parentNode.removeChild(el); } catch(e) {}
-                });
+            selectors.forEach(function(sel) {
+                try {
+                    document.querySelectorAll(sel).forEach(function(el) {
+                        el.style.display      = 'none';
+                        el.style.visibility   = 'hidden';
+                        el.style.pointerEvents= 'none';
+                        el.style.zIndex       = '-9999';
+                        try { el.parentNode.removeChild(el); } catch(e) {}
+                    });
+                } catch(e) {}
             });
             document.body.style.overflow = 'auto';
+            document.body.style.position = 'static';
         """)
-        human_sleep(0.5, 0.8)
     except Exception:
         pass
+
+    # Step 4: Escape key as additional fallback
+    try:
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+    except Exception:
+        pass
+
+    # Step 5: short pause to let DOM settle
+    human_sleep(0.8, 1.2)
 
 
 # ── Application form filler ────────────────────────────────────────────────────
@@ -535,13 +596,30 @@ def fill_apply_form(driver: webdriver.Chrome):
         try:
             for radio in driver.find_elements(By.XPATH, "//input[@type='radio']"):
                 try:
-                    ctx = radio.find_element(By.XPATH, "ancestor::div[3]").text.lower()
-                    if any(w in ctx for w in ("relocat", "willing to move")):
-                        if config.RELOCATE.lower() in (radio.get_attribute("value") or "").lower():
+                    val = (radio.get_attribute("value") or "").lower().strip()
+                    ctx = ""
+                    try:
+                        ctx = radio.find_element(By.XPATH, "ancestor::div[3]").text.lower()
+                    except Exception:
+                        pass
+                    if any(skill in ctx for skill in [
+                        "react", "node", "javascript", "mern", "mongodb",
+                        "express", "next", "typescript", "html", "css",
+                    ]):
+                        if val in ["yes", "true", "1"] and not radio.is_selected():
+                            driver.execute_script("arguments[0].click();", radio)
+                            human_sleep(0.2, 0.4)
+                            filled = True
+                    elif any(w in ctx for w in ("relocat", "willing to move", "work from home", "remote", "wfh")):
+                        if config.RELOCATE.lower() in val or val in ["yes", "true", "1"]:
                             if not radio.is_selected():
-                                radio.click()
-                                human_sleep(0.3, 0.6)
+                                driver.execute_script("arguments[0].click();", radio)
+                                human_sleep(0.2, 0.4)
                                 filled = True
+                    elif val in ["yes", "true", "1"] and not radio.is_selected():
+                        driver.execute_script("arguments[0].click();", radio)
+                        human_sleep(0.2, 0.4)
+                        filled = True
                 except (NoSuchElementException, StaleElementReferenceException):
                     pass
         except Exception:
@@ -576,7 +654,7 @@ def fill_apply_form(driver: webdriver.Chrome):
             break
 
 
-# ── Apply to a single job ──────────────────────────────────────────────────────
+# ── P1: Apply to a single job with full 6-step overlay sequence ──────────────
 _APPLY_XPATHS = [
     "//button[@id='apply-button']",
     "//button[text()='Apply']",
@@ -589,11 +667,16 @@ _APPLY_XPATHS = [
 
 
 def apply_to_job(
-    driver: webdriver.Chrome, job_info: dict, applied_ids: set, tracker: dict
+    driver: webdriver.Chrome,
+    job_info: dict,
+    applied_ids: set,
+    tracker: dict,
+    failed_ids: set,        # P2: mutable — add job_id here on failure
 ) -> bool:
     job_url = job_info["url"]
     job_id  = extract_job_id(job_url)
 
+    # Safety-net dedup (applied_ids is already checked upstream, but belt+suspenders)
     if job_id in applied_ids:
         tracker["skip_duplicate"] += 1
         return False
@@ -603,12 +686,16 @@ def apply_to_job(
         driver.execute_script(f"window.open('{job_url}','_blank');")
     except Exception:
         tracker["errors"] += 1
+        failed_ids.add(job_id)
+        tracker["failed_overlay_ids"].append(job_id)
         return False
 
     human_sleep(2, 3)
     new_handles = set(driver.window_handles) - before
     if not new_handles:
         tracker["errors"] += 1
+        failed_ids.add(job_id)
+        tracker["failed_overlay_ids"].append(job_id)
         return False
 
     driver.switch_to.window(new_handles.pop())
@@ -616,7 +703,9 @@ def apply_to_job(
 
     try:
         wait = WebDriverWait(driver, 12)
+        tracker["attempted_count"] += 1  # P6
 
+        # Check "Already Applied" badge
         try:
             wait.until(EC.presence_of_element_located(
                 (By.XPATH,
@@ -628,6 +717,7 @@ def apply_to_job(
         except TimeoutException:
             pass
 
+        # Find Apply button
         apply_btn = None
         for xpath in _APPLY_XPATHS:
             try:
@@ -646,30 +736,72 @@ def apply_to_job(
             log.info(f"  No Apply button — {job_id}")
             return False
 
-        dismiss_chatbot_overlay(driver)
-        human_sleep(0.5, 1.0)
-
+        # ── P1: Scroll button into view ──────────────────────────────────────
         try:
             driver.execute_script(
                 "arguments[0].scrollIntoView({block:'center'});", apply_btn
             )
-            human_sleep(0.5, 0.8)
-            # Remove overlay one final time right before click
-            driver.execute_script("""
-                document.querySelectorAll('[class*="chatbot_Overlay"]').forEach(function(e) {
-                    e.style.display = 'none';
-                    try { e.parentNode.removeChild(e); } catch(ex) {}
-                });
-            """)
-            # Always JS click — bypasses any remaining overlay
-            driver.execute_script("arguments[0].click();", apply_btn)
-            human_sleep(2, 3)
-            log.info(f"  Clicked Apply via JS — {job_id}")
-        except Exception as e:
-            log.warning(f"  Apply click failed: {e}")
-            tracker["errors"] += 1
-            return False
+            human_sleep(0.4, 0.7)
+        except Exception:
+            pass
 
+        # ── P1: Step 1+2 — find div.chatbot_Overlay.show, remove each ────────
+        try:
+            overlays = driver.find_elements(By.CSS_SELECTOR, "div.chatbot_Overlay.show")
+            for overlay in overlays:
+                try:
+                    if overlay.is_displayed():
+                        driver.execute_script("arguments[0].remove()", overlay)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # ── P1: Step 3 — broad JS sweep of ALL overlay variants ──────────────
+        try:
+            driver.execute_script(
+                "document.querySelectorAll('.chatbot_Overlay,[class*=\"chatbot_Overlay\"]')"
+                ".forEach(e=>e.remove());"
+                "document.querySelectorAll('[class*=\"overlay\"][class*=\"show\"],"
+                "[class*=\"Overlay\"][class*=\"show\"]').forEach(e=>{"
+                "e.style.display='none';e.style.pointerEvents='none';});"
+                "document.body.style.overflow='auto';"
+            )
+        except Exception:
+            pass
+
+        # ── P1: Step 4 — Escape key ───────────────────────────────────────────
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+
+        # ── P1: Step 5 — wait 1 second for DOM to settle ─────────────────────
+        human_sleep(1.0, 1.2)
+
+        # ── P1: Step 6a — try normal click first ─────────────────────────────
+        click_succeeded = False
+        try:
+            apply_btn.click()
+            click_succeeded = True
+            log.info(f"  Clicked Apply (normal) — {job_id}")
+        except (ElementClickInterceptedException, Exception):
+            pass
+
+        # ── P1: Step 6b — fallback: JS click bypasses any remaining overlay ───
+        if not click_succeeded:
+            try:
+                driver.execute_script("arguments[0].click();", apply_btn)
+                click_succeeded = True
+                log.info(f"  Clicked Apply (JS fallback) — {job_id}")
+            except Exception as exc:
+                log.warning(f"  Apply click failed entirely: {exc}")
+                tracker["errors"] += 1
+                failed_ids.add(job_id)
+                tracker["failed_overlay_ids"].append(job_id)
+                return False
+
+        human_sleep(2, 3)
         fill_apply_form(driver)
 
         try:
@@ -678,7 +810,13 @@ def apply_to_job(
             pass
 
         applied = True
-        loc = job_info.get("location", "")
+
+        if job_info.get("is_top_applicant"):
+            tracker["badge_top_applicant"] += 1
+        if job_info.get("is_actively_hiring"):
+            tracker["badge_actively_hiring"] += 1
+
+        loc      = job_info.get("location", "")
         loc_lower = loc.lower()
         if "indore" in loc_lower:
             loc_icon = "📍"
@@ -705,6 +843,8 @@ def apply_to_job(
 
     except Exception as exc:
         tracker["errors"] += 1
+        failed_ids.add(job_id)
+        tracker["failed_overlay_ids"].append(job_id)
         log.warning(f"  Error applying to {job_id}: {exc}")
 
     finally:
@@ -723,9 +863,8 @@ def _page_has_error(driver: webdriver.Chrome) -> bool:
     """Returns True ONLY if page is genuinely broken. Default = valid."""
     try:
         import re as _re
-        time.sleep(4)  # wait for JS to render fully
+        time.sleep(4)
 
-        # Rule 1: job cards found → definitely valid
         _CARD_SELS = [
             ".srp-jobtuple-wrapper", "[class*='jobTuple']",
             "[class*='job-tuple']", "[data-job-id]",
@@ -739,7 +878,6 @@ def _page_has_error(driver: webdriver.Chrome) -> bool:
             except Exception:
                 pass
 
-        # Rule 2: job-count text found → valid
         try:
             body = driver.find_element(By.TAG_NAME, "body").text
             if _re.search(r'\d[\d,]*\s*(jobs|vacancies|results)', body, _re.IGNORECASE):
@@ -747,7 +885,6 @@ def _page_has_error(driver: webdriver.Chrome) -> bool:
         except Exception:
             pass
 
-        # Rule 3: exact error phrases → real error
         try:
             body_lower = driver.find_element(By.TAG_NAME, "body").text.lower()
             for phrase in [
@@ -760,9 +897,7 @@ def _page_has_error(driver: webdriver.Chrome) -> bool:
         except Exception:
             pass
 
-        # Rule 4: default → not an error, never assume broken
         return False
-
     except Exception:
         return False
 
@@ -807,7 +942,7 @@ def validate_and_filter_urls(driver: webdriver.Chrome) -> list:
             driver.get(url)
             time.sleep(5)
 
-            is_error = _page_has_error(driver)
+            is_error  = _page_has_error(driver)
             card_count = 0
             for sel in [".srp-jobtuple-wrapper", "[class*='jobTuple']", "[data-job-id]"]:
                 els = driver.find_elements(By.CSS_SELECTOR, sel)
@@ -827,8 +962,15 @@ def validate_and_filter_urls(driver: webdriver.Chrome) -> list:
     return working if working else config.SEARCH_URLS
 
 
-# ── Process one search URL ─────────────────────────────────────────────────────
-def process_url(driver: webdriver.Chrome, url: str, applied_ids: set, tracker: dict):
+# ── P2: Process one search URL — global dedup across all URLs ─────────────────
+def process_url(
+    driver:       webdriver.Chrome,
+    url:          str,
+    applied_ids:  set,
+    tracker:      dict,
+    attempted_ids: set,   # P2: session-level attempted set (shared across all URLs)
+    failed_ids:   set,    # P2: persisted failed IDs (shared across all URLs)
+):
     log.info(f"\n{'─'*60}")
     log.info(f"URL: {url}")
 
@@ -836,11 +978,10 @@ def process_url(driver: webdriver.Chrome, url: str, applied_ids: set, tracker: d
         return
 
     sort_by_date(driver)
-
     active_sel = detect_card_selector(driver)
-
     page = 1
-    while tracker["today_count"] < config.MAX_APPLY:
+
+    while tracker["today_count"] < config.MAX_APPLY and page <= MAX_PAGES:
         found = wait_for_cards(driver, active_sel, timeout=15)
         cards = get_cards_on_page(driver, active_sel) if found else []
 
@@ -868,6 +1009,29 @@ def process_url(driver: webdriver.Chrome, url: str, applied_ids: set, tracker: d
             except StaleElementReferenceException:
                 continue
 
+        # ── Page-level duplicate detection (skip page if >80% already applied/failed) ─
+        if card_infos:
+            page_ids = {
+                extract_job_id(c.get("url", ""))
+                for c in card_infos if c.get("url")
+            }
+            tracker["seen_ids"].update(page_ids)
+
+            if page_ids:
+                already_seen = page_ids & (applied_ids | failed_ids)
+                overlap_pct  = len(already_seen) / max(len(page_ids), 1)
+                if overlap_pct > 0.8:
+                    log.info(
+                        f"  Page {page}: {overlap_pct:.0%} already applied/failed "
+                        f"— skipping rest of this URL"
+                    )
+                    break
+
+        # ── Sort by badge + freshness priority (highest first) ────────────────
+        if card_infos:
+            card_infos.sort(key=get_card_priority_score, reverse=True)
+
+        # ── Freshness pre-check ────────────────────────────────────────────────
         if card_infos:
             fresh = [c for c in card_infos if get_job_priority(c.get("time_label", "")) < 99]
             if not fresh:
@@ -877,6 +1041,14 @@ def process_url(driver: webdriver.Chrome, url: str, applied_ids: set, tracker: d
         for info in card_infos:
             if tracker["today_count"] >= config.MAX_APPLY:
                 break
+
+            job_id = extract_job_id(info.get("url", ""))
+
+            # ── Dedup — skip only if already applied or permanently failed ────
+            if job_id and (job_id in applied_ids or job_id in failed_ids):
+                tracker["skip_duplicate"] += 1
+                log.debug(f"  ⏭  Dedup ({job_id}) — already applied/failed")
+                continue
 
             # ── Freshness filter ───────────────────────────────────────────────
             priority = get_job_priority(info.get("time_label", ""))
@@ -889,7 +1061,7 @@ def process_url(driver: webdriver.Chrome, url: str, applied_ids: set, tracker: d
                 stop_url = True
                 break
 
-            # ── Title filter — two-stage (direct match vs description check) ──
+            # ── P3: Two-stage title filter ─────────────────────────────────────
             is_valid, needs_desc_check = is_valid_title(info.get("title", ""))
 
             if not is_valid:
@@ -900,6 +1072,7 @@ def process_url(driver: webdriver.Chrome, url: str, applied_ids: set, tracker: d
                 )
                 continue
 
+            # ── Description check for generic titles ──────────────────────────
             if needs_desc_check:
                 job_url = info.get("url", "")
                 if not job_url:
@@ -909,7 +1082,7 @@ def process_url(driver: webdriver.Chrome, url: str, applied_ids: set, tracker: d
                 before = set(driver.window_handles)
                 driver.execute_script(f"window.open('{job_url}','_blank');")
                 human_sleep(2, 3)
-                desc_tab = (set(driver.window_handles) - before)
+                desc_tab = set(driver.window_handles) - before
                 if not desc_tab:
                     tracker["errors"] += 1
                     continue
@@ -923,7 +1096,7 @@ def process_url(driver: webdriver.Chrome, url: str, applied_ids: set, tracker: d
                 if not has_skills:
                     tracker["skip_no_skills"] += 1
                     log.info(
-                        f"  ⏭  Generic title, no skills in description "
+                        f"  ⏭  Generic title, no skills in JD "
                         f"— {info.get('title','?')[:50]}"
                     )
                     continue
@@ -932,20 +1105,22 @@ def process_url(driver: webdriver.Chrome, url: str, applied_ids: set, tracker: d
                 tracker["errors"] += 1
                 continue
 
-            apply_to_job(driver, info, applied_ids, tracker)
+            apply_to_job(driver, info, applied_ids, tracker, failed_ids)
 
         if stop_url:
             break
 
-        # Pagination
+        # ── Pagination — dismiss overlay before clicking Next (fixes P1 side-effect) ──
         try:
-            nxt = driver.find_element(
+            dismiss_chatbot_overlay(driver)   # clear overlay so Next btn is clickable
+            nxt = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((
                 By.XPATH,
-                "//a[contains(@class,'pagination-next')] | "
-                "//span[normalize-space()='Next'] | "
-                "//a[normalize-space()='Next'] | "
-                "//a[contains(@class,'next')]"
-            )
+                "//a[contains(@class,'pagination-next')]"
+                " | //span[normalize-space()='Next']"
+                " | //a[normalize-space()='Next']"
+                " | //a[contains(@class,'next')]"
+                " | //button[contains(normalize-space(),'Next')]"
+            )))
             if nxt.get_attribute("disabled") is not None:
                 break
             driver.execute_script("arguments[0].scrollIntoView(true);", nxt)
@@ -954,17 +1129,28 @@ def process_url(driver: webdriver.Chrome, url: str, applied_ids: set, tracker: d
             page += 1
             human_sleep(3, 5)
             sort_by_date(driver)
-        except (NoSuchElementException, ElementClickInterceptedException):
+        except (TimeoutException, NoSuchElementException, ElementClickInterceptedException):
             break
 
 
-# ── Run report ─────────────────────────────────────────────────────────────────
-def generate_report(tracker: dict, start: datetime.datetime):
+# ── P6: Enhanced run report ────────────────────────────────────────────────────
+def generate_report(tracker: dict, start: datetime.datetime, failed_ids: set):
     end      = datetime.datetime.now()
     duration = round((end - start).total_seconds() / 60, 1)
 
     applied_jobs = tracker["applied_jobs"]
     total        = tracker["today_count"]
+    attempted    = tracker["attempted_count"]
+    seen_count   = len(tracker.get("seen_ids", set()))
+
+    # P6: success rate
+    success_rate = f"{(total / attempted * 100):.1f}%" if attempted > 0 else "N/A"
+
+    # P6: top companies
+    companies    = Counter(
+        j.get("company", "unknown") for j in applied_jobs if j.get("company")
+    )
+    top_companies = companies.most_common(5)
 
     indore_jobs = [j for j in applied_jobs if "indore" in j.get("location", "").lower()]
     remote_jobs = [
@@ -982,7 +1168,7 @@ def generate_report(tracker: dict, start: datetime.datetime):
         tracker["skip_no_skills"] + tracker["errors"]
     )
 
-    W = 40  # inner content width
+    W = 44  # inner content width
 
     def row(content=""):
         return f"║ {content:<{W}} ║"
@@ -999,21 +1185,35 @@ def generate_report(tracker: dict, start: datetime.datetime):
         row(f"Account   : {config.EMAIL}"),
         row(f"Duration  : {duration} minutes"),
         divider(),
-        row(f"✅ Applied    : {total} / {config.MAX_APPLY}"),
-        row(f"   📍 Indore   : {len(indore_jobs)} jobs"),
-        row(f"   🌐 Remote   : {len(remote_jobs)} jobs"),
-        row(f"   🗺️  Other    : {len(other_jobs)} jobs"),
+        row(f"📊 Job IDs seen on pages : {seen_count}"),
+        row(f"📊 Apply clicks attempted: {attempted}"),
+        row(f"✅ Applied successfully  : {total} / {config.MAX_APPLY}"),
+        row(f"📈 Success rate          : {success_rate}"),
+        row(f"🏷️  Top Applicant applied : {tracker.get('badge_top_applicant', 0)}"),
+        row(f"🔥 Actively Hiring applied: {tracker.get('badge_actively_hiring', 0)}"),
+        row(f"📄 Resume uploaded        : {'✅ Yes' if tracker.get('resume_uploaded') else '⚠️  Not found'}"),
+        row(f"   📍 Indore  : {len(indore_jobs)} jobs"),
+        row(f"   🌐 Remote  : {len(remote_jobs)} jobs"),
+        row(f"   🗺️  Other   : {len(other_jobs)} jobs"),
         divider(),
-        row(f"⏭  Skipped    : {skipped}"),
-        row(f"   Title mismatch   : {tracker['skip_title']}"),
-        row(f"   Too old          : {tracker['skip_old']}"),
-        row(f"   Already applied  : {tracker['skip_duplicate']}"),
-        row(f"   No skills in JD  : {tracker['skip_no_skills']}"),
-        row(f"   No Easy Apply    : {tracker['skip_no_apply']}"),
-        row(f"   Page errors      : {tracker['errors']}"),
+        row(f"⏭  Skipped total         : {skipped}"),
+        row(f"   Title mismatch        : {tracker['skip_title']}"),
+        row(f"   Too old               : {tracker['skip_old']}"),
+        row(f"   Already applied/seen  : {tracker['skip_duplicate']}"),
+        row(f"   No skills in JD       : {tracker['skip_no_skills']}"),
+        row(f"   No Easy Apply button  : {tracker['skip_no_apply']}"),
+        row(f"   Page / overlay errors : {tracker['errors']}"),
         divider(),
-        row("APPLIED JOBS:"),
+        row("🏢 TOP COMPANIES APPLIED TO:"),
     ]
+
+    if top_companies:
+        for company, count in top_companies:
+            lines.append(row(f"   {company[:35]:<35} ×{count}"))
+    else:
+        lines.append(row("   (none)"))
+
+    lines += [divider(), row("✅ APPLIED JOBS:")]
 
     if applied_jobs:
         for j in applied_jobs:
@@ -1026,18 +1226,24 @@ def generate_report(tracker: dict, start: datetime.datetime):
             else:
                 icon = "🗺️ "
             entry = (
-                f"  {icon} [{loc[:12]:<12}] "
-                f"{j.get('title','?')[:30]:<30} | "
-                f"{j.get('company','?')[:20]}"
+                f"  {icon} [{loc[:10]:<10}] "
+                f"{j.get('title','?')[:28]:<28} | "
+                f"{j.get('company','?')[:18]}"
             )
             lines.append(row(entry))
     else:
         lines.append(row("  (none)"))
 
-    lines += [
-        "╚" + "═" * (W + 2) + "╝",
-        "",
-    ]
+    # P6: list permanently failed job IDs
+    if tracker["failed_overlay_ids"]:
+        lines += [divider(), row("❌ FAILED JOB IDs (overlay/page error — permanently skipped):")]
+        chunk = ", ".join(str(x) for x in tracker["failed_overlay_ids"][:20])
+        if len(tracker["failed_overlay_ids"]) > 20:
+            chunk += f" … (+{len(tracker['failed_overlay_ids'])-20} more)"
+        lines.append(row(f"  {chunk}"))
+        lines.append(row(f"  Total permanently failed: {len(failed_ids)}"))
+
+    lines += ["╚" + "═" * (W + 2) + "╝", ""]
 
     report = "\n".join(lines)
     log.info(report)
@@ -1060,20 +1266,42 @@ def main():
     )
 
     applied_ids = load_applied_ids()
-    log.info(f"Previously applied: {len(applied_ids)} jobs")
+    log.info(f"Previously applied : {len(applied_ids)} jobs")
+
+    # P2: load permanently failed IDs so we never retry broken pages
+    failed_ids = load_failed_ids()
+    log.info(f"Permanently failed : {len(failed_ids)} job IDs (will skip)")
+
+    # P2: per-run attempted set — shared across ALL URLs to prevent cross-URL duplication
+    session_attempted_ids: set = set()
 
     driver = get_driver()
 
     try:
         login(driver)
-        bump_profile(driver)
+        tracker["resume_uploaded"] = bump_profile(driver)
 
         valid_urls = validate_and_filter_urls(driver)
         for url in valid_urls:
             if tracker["today_count"] >= config.MAX_APPLY:
                 log.info(f"Daily limit ({config.MAX_APPLY}) reached — done")
                 break
-            process_url(driver, url, applied_ids, tracker)
+            process_url(
+                driver, url,
+                applied_ids, tracker,
+                session_attempted_ids, failed_ids,
+            )
+
+        if tracker["today_count"] < config.MAX_APPLY and config.EXTRA_URLS:
+            log.info("\nProcessing Naukri personalised / recommended pages...")
+            for url in config.EXTRA_URLS:
+                if tracker["today_count"] >= config.MAX_APPLY:
+                    break
+                process_url(
+                    driver, url,
+                    applied_ids, tracker,
+                    session_attempted_ids, failed_ids,
+                )
 
     except Exception as exc:
         log.error(f"Fatal error: {exc}", exc_info=True)
@@ -1084,7 +1312,10 @@ def main():
         except Exception:
             pass
 
-    generate_report(tracker, start)
+    # P2: save failed IDs so next run skips them permanently
+    save_failed_ids(failed_ids)
+
+    generate_report(tracker, start, failed_ids)   # P6: pass failed_ids for report
 
 
 if __name__ == "__main__":

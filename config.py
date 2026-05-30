@@ -19,79 +19,141 @@ LOCATION      = os.getenv("CURRENT_LOCATION", "Indore")
 RELOCATE      = os.getenv("WILLING_TO_RELOCATE", "Yes")
 
 # ── Run settings ───────────────────────────────────────────────────────────────
-MAX_APPLY   = int(os.getenv("MAX_APPLY", "40"))
-HEADLESS    = os.getenv("HEADLESS", "false").lower() == "true"
-RESUME_PATH = Path(os.getenv("RESUME_PATH", "resume.pdf"))
+MAX_APPLY = int(os.getenv("MAX_APPLY", "40"))
+HEADLESS  = os.getenv("HEADLESS", "false").lower() == "true"
 
-# ── Search URLs — All India + Remote, last 24 hrs, newest first ────────────────
+# ── Resume — searched in order, first existing file wins ──────────────────────
+RESUME_PATHS = [
+    Path(os.getenv("RESUME_PATH", "resume.pdf")),
+    Path(r"C:\Users\hp\Downloads\NaukriCronChecker\resume.pdf"),
+    Path(r"C:\Users\hp\Downloads\resume.pdf"),
+    Path(r"C:\Users\hp\Desktop\resume.pdf"),
+    Path(r"C:\Users\hp\Documents\resume.pdf"),
+]
+RESUME_PATH = next((p for p in RESUME_PATHS if p.exists()), RESUME_PATHS[0])
+
+# ── Search URLs — 20 URLs × 2 pages = 800 jobs pool ──────────────────────────
 SEARCH_URLS = [
-    # ── Confirmed working Naukri slug URLs ────────────────────────────────────
-    "https://www.naukri.com/mern-stack-jobs?experience=3",
     "https://www.naukri.com/mern-stack-developer-jobs?experience=3",
     "https://www.naukri.com/mern-jobs?experience=3",
     "https://www.naukri.com/mern-stack-developer-jobs-in-remote?experience=3",
-    "https://www.naukri.com/full-stack-developer-jobs?experience=3",
     "https://www.naukri.com/react-js-jobs?experience=3",
+    "https://www.naukri.com/react-developer-jobs?experience=3",
+    "https://www.naukri.com/reactjs-jobs?experience=3",
     "https://www.naukri.com/node-js-jobs?experience=3",
-    "https://www.naukri.com/javascript-jobs?experience=3",
-    "https://www.naukri.com/software-developer-jobs?experience=3",
-    "https://www.naukri.com/web-developer-jobs?experience=3",
-    "https://www.naukri.com/front-end-developer-jobs?experience=3",
+    "https://www.naukri.com/nodejs-developer-jobs?experience=3",
+    "https://www.naukri.com/full-stack-developer-jobs?experience=3",
     "https://www.naukri.com/full-stack-developer-jobs-in-remote?experience=3",
+    "https://www.naukri.com/fullstack-developer-jobs?experience=3",
+    "https://www.naukri.com/javascript-jobs?experience=3",
+    "https://www.naukri.com/javascript-developer-jobs?experience=3",
+    "https://www.naukri.com/front-end-developer-jobs?experience=3",
+    "https://www.naukri.com/frontend-developer-jobs?experience=3",
+    "https://www.naukri.com/backend-developer-jobs?experience=3",
+    "https://www.naukri.com/web-developer-jobs?experience=3",
+    "https://www.naukri.com/software-developer-jobs?experience=3",
+    "https://www.naukri.com/web-developer-jobs-in-remote?experience=3",
+    "https://www.naukri.com/next-js-developer-jobs?experience=3",
 ]
 
-# ── Title keyword filters ──────────────────────────────────────────────────────
-ACCEPT_KEYWORDS = [
-    # Core MERN
-    "mern", "mean",
-    # Full Stack
-    "full stack", "fullstack", "full-stack",
-    # React
-    "react", "reactjs", "react.js",
-    # Node
-    "node", "nodejs", "node.js",
-    # JavaScript / TypeScript
-    "javascript", "typescript", "js developer",
-    # Frontend
-    "frontend", "front-end", "front end",
-    "ui developer", "ui engineer",
-    "next.js", "nextjs",
-    # Backend
-    "backend", "back-end",
-    "express", "mongodb",
-    # General
-    "software developer", "software engineer",
-    "web developer", "web engineer",
-    "application developer",
-    "ai developer",
-    "python developer",
-    "api developer",
+# ── Extra personalised Naukri pages (processed after main URLs) ───────────────
+EXTRA_URLS = [
+    "https://www.naukri.com/mnjuser/recommendedjobs",
+    "https://www.naukri.com/mnjuser/jobsearchrecommendation",
 ]
 
+# ── STEP 1 — Hard-reject: ANY match in title → skip immediately ───────────────
 REJECT_KEYWORDS = [
+    # Seniority mismatch
+    "fresher", "trainee", "intern",
+    # Finance / banking / back-office
+    "banking officer", "back office", "banker",
+    "loan officer", "finance executive",
+    # BPO / support / sales / HR
+    "support", "bpo", "telecaller", "customer service",
+    "voice process", "chat process", "call centre", "call center",
+    "coordinator", "sales", "business development",
+    "recruiter", "hr executive", "hr manager",
+    "talent acquisition", "marketing executive",
+    # Data / analytics / ML (not MERN)
+    "data entry", "data scientist", "data analyst",
+    "machine learning", "remote sensing",
+    "power bi", "tableau", "etl",
+    # Ops / infra / QA (not MERN)
+    "devops", "cloud engineer",
+    "automation tester", "qa engineer", "qa tester",
+    "manual tester", "selenium tester",
+    "business analyst",
+    "shell scripting", "networking", "hardware engineer",
+    # Wrong mobile / cross-platform stacks
+    "android", "ios",
+    "flutter", "dart",
+    # Wrong backend stacks
+    "ruby", "rails",
+    "perl", "scala", "kotlin",
+    "haskell", "erlang", "elixir",
+    "fortran", "matlab", "r language",
+    "cobol", "assembly", "lua",
+    "groovy", "clojure", "lisp",
+    "ocaml", "julia", "f#",
+    "objective-c", "swift",
+    "rust developer",
+    "dot net", ".net developer", "asp.net",
+    "php developer", "laravel developer",
+    # CMS / ecommerce platforms
+    "wordpress", "shopify", "magento", "woocommerce",
+    # Embedded / hardware
+    "embedded", "firmware", "vlsi", "vhdl", "fpga",
     # Non-tech
-    "back office", "data entry",
-    "chat support", "voice process",
-    "bpo", "call centre", "call center",
-    "phone banking", "branch banking",
-    "banking operation",
-    # HR / Sales
-    "recruiter", "hr executive",
-    "talent acquisition",
-    "sales executive", "marketing",
-    # Wrong tech stack
-    "embedded", "firmware", "simulation",
-    "mechanical", "civil",
     "graphic designer", "video editor",
-    "content writer",
-    "dot net", ".net developer",
-    "java developer", "php developer",
-    "android developer", "ios developer",
-    "flutter developer",
-    "data scientist",
-    "machine learning engineer",
-    "devops engineer",
-    "manual tester", "qa engineer",
+    "content writer", "seo",
+    "mechanical", "civil", "electrical", "accountant",
+    # AI evaluation spam jobs
+    "ai evaluation", "ai code evaluation",
+    # Gig / blockchain / legacy
+    "freelance", "game developer",
+    "blockchain", "solidity",
+    "sap", "oracle developer",
+]
+
+# ── STEP 2 — Must match at least ONE accept keyword ───────────────────────────
+# ACCEPT_SPECIFIC: clear tech match → apply without opening job page
+ACCEPT_SPECIFIC = [
+    "full stack", "fullstack", "full-stack",
+    "mern", "mean", "pern", "fern",
+    "react", "reactjs", "react.js",
+    "node", "nodejs", "node.js",
+    "javascript", "typescript",
+    "next.js", "nextjs",
+    "express", "expressjs",
+    "mongo", "mongodb",
+    "frontend developer", "frontend engineer",
+    "front-end developer", "front end developer",
+    "backend developer", "backend engineer",
+    "back-end developer", "back end developer",
+    "ui developer",
+]
+
+# ACCEPT_GENERIC: vague title → must also pass description skill check (STEP 3)
+ACCEPT_GENERIC = [
+    "web developer", "web engineer",
+    "software developer", "software engineer",
+    "application developer",
+    "product engineer", "product developer",
+    "sde", "sde-1", "sde1", "sde-2",
+    "junior developer", "senior developer", "associate developer",
+    "programmer",
+]
+
+ACCEPT_KEYWORDS = ACCEPT_SPECIFIC + ACCEPT_GENERIC
+
+# ── STEP 3 — Description skill check (at least 1 required for generic titles) ─
+REQUIRED_SKILLS = [
+    "react", "reactjs", "node", "nodejs",
+    "javascript", "mern", "mongodb", "mongo",
+    "express", "expressjs", "next.js", "nextjs",
+    "redux", "rest api", "graphql", "typescript",
+    "html", "css", "tailwind",
 ]
 
 # ── Cover letter ───────────────────────────────────────────────────────────────
